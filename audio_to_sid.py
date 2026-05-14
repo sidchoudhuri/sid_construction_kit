@@ -337,6 +337,58 @@ def _smooth_notes(notes: list[int], min_hold: int = 4) -> list[int]:
     return out
 
 
+def _quantize_to_grid(notes: list[int], onset_frames: set[int],
+                      frames_per_cell: int) -> list[int]:
+    """
+    Snap notes onto a musical time grid.
+
+    Each grid cell spans `frames_per_cell` frames (≈ one 16th note at the
+    detected tempo).  Within each cell the most-common non-zero note wins;
+    a note change is only accepted when there is an onset in that cell,
+    otherwise the previous note carries forward.  This turns the raw
+    50 Hz per-frame stream into a note-event sequence that sounds like a
+    real SID composition rather than a continuous pitch tracker.
+    """
+    from collections import Counter
+    n = len(notes)
+    out = [0] * n
+    prev = 0
+    cell_size = max(1, frames_per_cell)
+
+    for cell_start in range(0, n, cell_size):
+        cell_end = min(cell_start + cell_size, n)
+        cell_notes = [notes[f] for f in range(cell_start, cell_end)]
+
+        non_zero = [x for x in cell_notes if x != 0]
+        candidate = Counter(non_zero).most_common(1)[0][0] if non_zero else 0
+
+        # Only change pitch when an onset lands in this cell
+        cell_has_onset = any(f in onset_frames for f in range(cell_start, cell_end))
+        if candidate != 0 and cell_has_onset:
+            prev = candidate
+        elif candidate == 0 and cell_has_onset:
+            prev = 0   # onset with no pitch = explicit silence
+
+        for f in range(cell_start, cell_end):
+            out[f] = prev
+
+    return out
+
+
+def _suppress_overlapping_voices(melody: list[int], high: list[int],
+                                 octave_threshold: int = 12) -> list[int]:
+    """
+    Mute Voice 2 (high lead) whenever it is within `octave_threshold`
+    semitones of Voice 0 (melody).  Melody always wins; Voice 2 only plays
+    when it has clearly independent content above the melody.
+    """
+    out = list(high)
+    for i, (m, h) in enumerate(zip(melody, high)):
+        if m != 0 and h != 0 and abs(h - m) < octave_threshold:
+            out[i] = 0
+    return out
+
+
 def extract_voices(y: np.ndarray, sr: int,
                    hop_length: int, n_frames: int) -> tuple:
     """
@@ -385,6 +437,32 @@ def extract_voices(y: np.ndarray, sr: int,
                                librosa.note_to_hz('C7'), hop_length, n_frames)
     v_high   = gate & np.array([p > 0 for p in p_high])
     high     = _smooth_notes(_autocorr_to_notes(p_high, v_high, 60, 96), min_hold=6)
+
+    # --- Musical time grid quantization ---
+    print("  Detecting tempo and onset grid…")
+    tempo, _ = librosa.beat.beat_track(y=harmonic, sr=sr, hop_length=hop_length)
+    tempo_val = float(tempo) if np.ndim(tempo) == 0 else float(tempo[0])
+    # frames per 16th note = (beats/min → beats/frame) / 4 subdivisions
+    frames_per_beat = (sr / hop_length) * (60.0 / max(tempo_val, 1.0))
+    frames_per_16th = max(1, int(round(frames_per_beat / 4)))
+    print(f"    Tempo={tempo_val:.1f} BPM  →  {frames_per_beat:.1f} frames/beat  "
+          f"→  {frames_per_16th} frames/16th-note")
+
+    onset_raw    = librosa.onset.onset_detect(y=harmonic, sr=sr,
+                                              hop_length=hop_length, units='frames')
+    onset_frames = set(int(f) for f in onset_raw)
+
+    melody = _quantize_to_grid(melody, onset_frames, frames_per_16th)
+    bass   = _quantize_to_grid(bass,   onset_frames, frames_per_16th)
+    high   = _quantize_to_grid(high,   onset_frames, frames_per_16th)
+
+    # Voice density control: suppress high lead when it overlaps melody
+    high = _suppress_overlapping_voices(melody, high)
+
+    n_overlap = sum(1 for m, h in zip(melody, high) if m != 0 and h != 0)
+    n_total   = sum(1 for m in melody if m != 0)
+    pct = 100 * n_overlap / max(n_total, 1)
+    print(f"    Voice 2 active simultaneously with melody: {pct:.0f}% of melody frames")
 
     # Per-frame waveform matching (Mahoney's correlateWaveforms, scaled to 3 SID waveforms)
     print("  Matching waveforms per frame…")
