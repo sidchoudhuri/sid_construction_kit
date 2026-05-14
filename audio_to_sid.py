@@ -12,10 +12,11 @@ Pipeline:
   6. Generate 6502 machine code that drives the SID chip each 50 Hz frame
   7. Write a valid PSID v2 file
 
-  Waveform mapping (no noise):
+  Waveform mapping:
     triangle  (0x10) — soft/few harmonics  → vocals, pads
     sawtooth  (0x20) — rich harmonics      → bass guitar, strings, brass
     pulse     (0x40) — hollow/nasal        → electric guitar, lead synth
+    noise     (0x80) — unpitched transient → percussion (when detected)
 
 Usage:
   python3 audio_to_sid.py <input_audio> <output.sid> [--title "Title"] [--author "Author"]
@@ -118,6 +119,11 @@ def analyze_instrument(y: np.ndarray, sr: int, band: str) -> dict:
     is_plucked  = pluck_score > 4.0
     is_bright   = centroid_n  > 0.15
     is_tonal    = flatness    < 0.10
+    is_perc     = flatness    > 0.25 and pluck_score > 6.0  # noisy transients, not pitched
+
+    # Percussion: noise waveform, sharp gate burst (fast attack/decay, no sustain)
+    if is_perc:
+        return {'waveform': 0x80, 'atdec': 0x03, 'sustrel': 0x03, 'name': 'percussion'}
 
     if band == 'bass':
         if is_plucked and is_tonal:
