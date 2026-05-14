@@ -4,12 +4,18 @@ audio_to_sid.py — Convert an audio file to a PSID-format C64 SID file.
 
 Pipeline:
   1. Load audio; separate harmonic and percussive components (HPSS)
-  2. Voice 0 (melody):    pyin pitch tracking on harmonic content, C3–C6 range
-  3. Voice 1 (bass):      pyin pitch tracking on low-passed harmonic, C1–C3 range
-  4. Voice 2 (percussion): onset detection on percussive component → noise bursts
+  2. Split harmonic signal into bass / mid / high bands
+  3. Analyse each band with spectral features to identify the dominant
+     instrument and choose the best SID waveform + ADSR automatically
+  4. pyin pitch tracking per band → three voice note lists
   5. Smooth/quantise notes; map to SID register values
   6. Generate 6502 machine code that drives the SID chip each 50 Hz frame
   7. Write a valid PSID v2 file
+
+  Waveform mapping (no noise):
+    triangle  (0x10) — soft/few harmonics  → vocals, pads
+    sawtooth  (0x20) — rich harmonics      → bass guitar, strings, brass
+    pulse     (0x40) — hollow/nasal        → electric guitar, lead synth
 
 Usage:
   python3 audio_to_sid.py <input_audio> <output.sid> [--title "Title"] [--author "Author"]
@@ -56,11 +62,6 @@ ATDEC      = [0x05, 0x0C, 0x13]
 SUSTREL    = [0x06, 0x0D, 0x14]
 VOL_FILTER = 0x18
 
-# Voice 0: triangle (melody), Voice 1: sawtooth (bass), Voice 2: pulse (harmony)
-WAVEFORM = [0x10, 0x20, 0x40]
-GATE_ON  = [w | 0x01 for w in WAVEFORM]
-GATE_OFF = [w & ~0x01 for w in WAVEFORM]
-
 # ---------------------------------------------------------------------------
 # Audio loading
 # ---------------------------------------------------------------------------
@@ -76,6 +77,80 @@ def load_audio(path: str, sr: int = 22050):
 def _lowpass(y: np.ndarray, sr: int, cutoff: float) -> np.ndarray:
     sos = butter(4, cutoff / (sr / 2), btype='low', output='sos')
     return sosfilt(sos, y)
+
+def _bandpass(y: np.ndarray, sr: int, lo: float, hi: float) -> np.ndarray:
+    nyq = sr / 2
+    sos = butter(4, [lo / nyq, hi / nyq], btype='band', output='sos')
+    return sosfilt(sos, y)
+
+def _highpass(y: np.ndarray, sr: int, cutoff: float) -> np.ndarray:
+    sos = butter(4, cutoff / (sr / 2), btype='high', output='sos')
+    return sosfilt(sos, y)
+
+
+def analyze_instrument(y: np.ndarray, sr: int, band: str) -> dict:
+    """
+    Classify the dominant instrument in y using spectral features and return
+    a SID voice config: waveform byte, atdec byte, sustrel byte, name string.
+
+    band: 'bass' | 'mid' | 'high'
+
+    Decision axes:
+      pluck_score  — onset peak / mean onset: high = plucked/percussive attack
+      centroid_n   — spectral centroid normalised to Nyquist: high = bright
+      flatness     — 0 = tonal, 1 = noisy
+
+    SID waveforms (no noise):
+      0x10 triangle  — soft, few harmonics → vocals, pads, sub bass
+      0x20 sawtooth  — rich harmonics     → bass guitar, strings, brass
+      0x40 pulse     — hollow/nasal       → electric guitar, lead synth, keys
+    """
+    if len(y) == 0 or np.max(np.abs(y)) < 1e-6:
+        return {'waveform': 0x10, 'atdec': 0x09, 'sustrel': 0xA4, 'name': 'silent'}
+
+    onset_env   = librosa.onset.onset_strength(y=y, sr=sr)
+    onset_mean  = np.mean(onset_env) + 1e-6
+    pluck_score = np.max(onset_env) / onset_mean   # > 4 = plucked
+
+    centroid_n = float(np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))) / (sr / 2)
+    flatness   = float(np.mean(librosa.feature.spectral_flatness(y=y)))
+
+    is_plucked  = pluck_score > 4.0
+    is_bright   = centroid_n  > 0.15
+    is_tonal    = flatness    < 0.10
+
+    if band == 'bass':
+        if is_plucked and is_tonal:
+            # Bass guitar: sawtooth, fast pluck (attack=0 ~2ms, decay=8 ~100ms,
+            # sustain=6, release=4 ~38ms)
+            return {'waveform': 0x20, 'atdec': 0x08, 'sustrel': 0x64, 'name': 'bass guitar'}
+        elif not is_plucked and centroid_n < 0.10:
+            # Organ/synth bass: sawtooth, slow attack, full sustain
+            return {'waveform': 0x20, 'atdec': 0x50, 'sustrel': 0xF4, 'name': 'synth/organ bass'}
+        else:
+            return {'waveform': 0x20, 'atdec': 0x18, 'sustrel': 0x82, 'name': 'bass (generic)'}
+
+    elif band == 'mid':
+        if is_plucked and is_bright:
+            # Electric guitar: pulse, fast attack, medium sustain
+            return {'waveform': 0x40, 'atdec': 0x06, 'sustrel': 0x74, 'name': 'electric guitar'}
+        elif is_plucked and not is_bright:
+            # Acoustic guitar / piano: pulse, fast attack, shorter sustain
+            return {'waveform': 0x40, 'atdec': 0x09, 'sustrel': 0x54, 'name': 'acoustic guitar/piano'}
+        elif not is_plucked and not is_bright:
+            # Vocals / soft lead: triangle, gentle attack
+            return {'waveform': 0x10, 'atdec': 0x32, 'sustrel': 0xB5, 'name': 'vocals/soft lead'}
+        else:
+            # Bright sustained: brass / organ / strings → sawtooth
+            return {'waveform': 0x20, 'atdec': 0x50, 'sustrel': 0xF4, 'name': 'organ/brass/strings'}
+
+    else:  # 'high'
+        if is_plucked:
+            return {'waveform': 0x40, 'atdec': 0x09, 'sustrel': 0x84, 'name': 'plucked high lead'}
+        elif is_bright:
+            return {'waveform': 0x20, 'atdec': 0x19, 'sustrel': 0xA4, 'name': 'bright high lead'}
+        else:
+            return {'waveform': 0x10, 'atdec': 0x19, 'sustrel': 0xA4, 'name': 'soft high lead'}
 
 
 def _f0_to_notes(f0: np.ndarray, voiced: np.ndarray,
@@ -116,17 +191,33 @@ def _smooth_notes(notes: list[int], min_hold: int = 4) -> list[int]:
 
 
 def extract_voices(y: np.ndarray, sr: int,
-                   hop_length: int, n_frames: int) -> tuple[list, list, list]:
+                   hop_length: int, n_frames: int) -> tuple[list, list, list, list]:
     """
-    Return three per-frame MIDI note lists (0 = silence):
-      voice 0 — melody   (triangle wave, C3–C6)
-      voice 1 — bass     (sawtooth wave, C1–C3)
-      voice 2 — harmony  (pulse wave, melody shifted up one octave)
+    Return three per-frame MIDI note lists (0 = silence) and a list of three
+    voice config dicts (waveform, atdec, sustrel, name) chosen by instrument
+    analysis of each frequency band:
+
+      voice 0 — mid band  C3–C6  (melody / lead)
+      voice 1 — bass band C1–C3  (bass instrument)
+      voice 2 — high band C4–C7  (upper harmonic / counter-melody)
     """
     print("  Separating harmonic / percussive components…")
     harmonic, _ = librosa.effects.hpss(y, margin=3.0)
 
-    # --- Voice 0: melody from harmonic, C3–C6 ---
+    bass_sig = _lowpass(harmonic, sr, 300.0)
+    mid_sig  = _bandpass(harmonic, sr, 300.0, 2000.0)
+    high_sig = _highpass(harmonic, sr, 2000.0)
+
+    # --- Instrument analysis per band ---
+    print("  Analysing instruments…")
+    cfg_mid  = analyze_instrument(mid_sig,  sr, 'mid')
+    cfg_bass = analyze_instrument(bass_sig, sr, 'bass')
+    cfg_high = analyze_instrument(high_sig, sr, 'high')
+    print(f"    Voice 0 (mid):  {cfg_mid['name']}")
+    print(f"    Voice 1 (bass): {cfg_bass['name']}")
+    print(f"    Voice 2 (high): {cfg_high['name']}")
+
+    # --- Voice 0: mid-range melody, C3–C6 ---
     print("  Tracking melody (C3–C6)…")
     f0_mel, voiced_mel, _ = librosa.pyin(
         harmonic,
@@ -135,9 +226,8 @@ def extract_voices(y: np.ndarray, sr: int,
         sr=sr, hop_length=hop_length)
     melody = _smooth_notes(_f0_to_notes(f0_mel, voiced_mel, 48, 84, n_frames), min_hold=4)
 
-    # --- Voice 1: bass from low-passed harmonic, C1–C3 ---
+    # --- Voice 1: bass, C1–C3 ---
     print("  Tracking bass (C1–C3)…")
-    bass_sig = _lowpass(harmonic, sr, 300.0)
     f0_bass, voiced_bass, _ = librosa.pyin(
         bass_sig,
         fmin=librosa.note_to_hz('C1'),
@@ -145,20 +235,21 @@ def extract_voices(y: np.ndarray, sr: int,
         sr=sr, hop_length=hop_length)
     bass = _smooth_notes(_f0_to_notes(f0_bass, voiced_bass, 24, 48, n_frames), min_hold=4)
 
-    # --- Voice 2: pulse harmony = melody shifted up one octave (clamped to C4–C8) ---
-    harmony = []
-    for note in melody:
-        if note > 0:
-            h = note + 12   # up one octave
-            h = max(60, min(96, h))   # C4–C8
-            harmony.append(h)
-        else:
-            harmony.append(0)
+    # --- Voice 2: high-mid counter-melody, C4–C7 ---
+    print("  Tracking high lead (C4–C7)…")
+    f0_high, voiced_high, _ = librosa.pyin(
+        mid_sig,
+        fmin=librosa.note_to_hz('C4'),
+        fmax=librosa.note_to_hz('C7'),
+        sr=sr, hop_length=hop_length)
+    high = _smooth_notes(_f0_to_notes(f0_high, voiced_high, 60, 96, n_frames), min_hold=4)
 
-    return melody, bass, harmony
+    # voice_configs ordered to match (voice0, voice1, voice2)
+    return melody, bass, high, [cfg_mid, cfg_bass, cfg_high]
 
 
-def build_sid_program(voice_notes: list[list[int]], total_frames: int) -> tuple[bytes, int, int]:
+def build_sid_program(voice_notes: list[list[int]], total_frames: int,
+                      voice_configs: list[dict] | None = None) -> tuple[bytes, int, int]:
     """
     Build 6502 machine code for a PSID tune.
 
@@ -176,10 +267,20 @@ def build_sid_program(voice_notes: list[list[int]], total_frames: int) -> tuple[
     def lo(addr): return addr & 0xFF
     def hi(addr): return (addr >> 8) & 0xFF
 
+    # Resolve waveforms from voice_configs (or sensible defaults)
+    defaults = [
+        {'waveform': 0x10, 'atdec': 0x09, 'sustrel': 0xA4},  # triangle melody
+        {'waveform': 0x20, 'atdec': 0x08, 'sustrel': 0x64},  # sawtooth bass
+        {'waveform': 0x40, 'atdec': 0x09, 'sustrel': 0x84},  # pulse high
+    ]
+    cfgs = voice_configs if voice_configs else defaults
+    waveforms = [cfgs[v]['waveform'] for v in range(3)]
+    gate_on   = [w | 0x01 for w in waveforms]
+    gate_off  = [w & ~0x01 for w in waveforms]
+
     # ------------------------------------------------------------------
     # Note data blob at NOTE_TABLE
     # Each frame: 3 voices × 3 bytes = (freq_lo, freq_hi, gate_ctrl)
-    # Voice 2 is percussion (noise): freq bytes unused, gate_ctrl only.
     # ------------------------------------------------------------------
     melody, bass, harmony = voice_notes   # unpack named voices
 
@@ -189,9 +290,9 @@ def build_sid_program(voice_notes: list[list[int]], total_frames: int) -> tuple[
             midi = voice[frame] if frame < len(voice) else 0
             if midi > 0:
                 reg = hz_to_sid_freq(midi_to_hz(midi))
-                note_data += bytes([reg & 0xFF, (reg >> 8) & 0xFF, GATE_ON[v]])
+                note_data += bytes([reg & 0xFF, (reg >> 8) & 0xFF, gate_on[v]])
             else:
-                note_data += bytes([0, 0, GATE_OFF[v]])
+                note_data += bytes([0, 0, gate_off[v]])
 
     # ------------------------------------------------------------------
     # INIT routine at LOAD_ADDR
@@ -202,20 +303,17 @@ def build_sid_program(voice_notes: list[list[int]], total_frames: int) -> tuple[
     init_code += bytes([0xA9, 0x00,
                         0x8D, lo(SID_BASE + VOL_FILTER), hi(SID_BASE + VOL_FILTER)])
     for v in range(3):
-        init_code += bytes([0xA9, GATE_OFF[v],
+        init_code += bytes([0xA9, gate_off[v],
                             0x8D, lo(SID_BASE + CTRL[v]), hi(SID_BASE + CTRL[v])])
-    # Voice 0 melody: fast attack, medium decay, high sustain, medium release
-    init_code += bytes([0xA9, 0x09, 0x8D, lo(SID_BASE + ATDEC[0]),   hi(SID_BASE + ATDEC[0]),
-                        0xA9, 0xA4, 0x8D, lo(SID_BASE + SUSTREL[0]), hi(SID_BASE + SUSTREL[0])])
-    # Voice 1 bass: slow attack, long decay, medium sustain, short release
-    init_code += bytes([0xA9, 0x30, 0x8D, lo(SID_BASE + ATDEC[1]),   hi(SID_BASE + ATDEC[1]),
-                        0xA9, 0x82, 0x8D, lo(SID_BASE + SUSTREL[1]), hi(SID_BASE + SUSTREL[1])])
-    # Voice 2 pulse harmony: medium attack, medium decay, medium sustain, medium release
-    init_code += bytes([0xA9, 0x09, 0x8D, lo(SID_BASE + ATDEC[2]),   hi(SID_BASE + ATDEC[2]),
-                        0xA9, 0x84, 0x8D, lo(SID_BASE + SUSTREL[2]), hi(SID_BASE + SUSTREL[2])])
-    # 50% pulse width for voice 2
-    init_code += bytes([0xA9, 0x00, 0x8D, lo(SID_BASE + PW_LO[2]), hi(SID_BASE + PW_LO[2]),
-                        0xA9, 0x08, 0x8D, lo(SID_BASE + PW_HI[2]), hi(SID_BASE + PW_HI[2])])
+    for v in range(3):
+        ad = cfgs[v]['atdec']
+        sr_ = cfgs[v]['sustrel']
+        init_code += bytes([0xA9, ad,  0x8D, lo(SID_BASE + ATDEC[v]),   hi(SID_BASE + ATDEC[v]),
+                            0xA9, sr_, 0x8D, lo(SID_BASE + SUSTREL[v]), hi(SID_BASE + SUSTREL[v])])
+        # Set 50% pulse width for any pulse-waveform voice
+        if waveforms[v] == 0x40:
+            init_code += bytes([0xA9, 0x00, 0x8D, lo(SID_BASE + PW_LO[v]), hi(SID_BASE + PW_LO[v]),
+                                0xA9, 0x08, 0x8D, lo(SID_BASE + PW_HI[v]), hi(SID_BASE + PW_HI[v])])
     init_code += bytes([0xA9, 0x00, 0x85, 0x02, 0x85, 0x03])   # zero frame counter
     init_code += bytes([0xA9, 0x0F,
                         0x8D, lo(SID_BASE + VOL_FILTER), hi(SID_BASE + VOL_FILTER)])
@@ -309,7 +407,7 @@ def build_sid_program(voice_notes: list[list[int]], total_frames: int) -> tuple[
     # done: silence all voices, RTS
     done_offset = pc[0]
     for v in range(3):
-        emit(0xA9, GATE_OFF[v])
+        emit(0xA9, gate_off[v])
         emit(0x8D, lo(SID_BASE + CTRL[v]), hi(SID_BASE + CTRL[v]))
     emit(0x60)                  # RTS
 
@@ -417,14 +515,14 @@ def main():
     print(f"  Duration: {duration_s:.1f}s  →  {n_frames} SID frames")
 
     print("Extracting voices…")
-    melody, bass, perc = extract_voices(y, sr, hop_length=HOP, n_frames=n_frames)
-    voice_notes = (melody, bass, perc)
+    melody, bass, high, voice_configs = extract_voices(y, sr, hop_length=HOP, n_frames=n_frames)
+    voice_notes = (melody, bass, high)
 
     print(f"  Encoding {n_frames} frames ({n_frames/FRAME_RATE:.1f}s)…")
 
     LOAD_ADDR = 0x1000
 
-    machine_code, init_addr, play_addr = build_sid_program(voice_notes, n_frames)
+    machine_code, init_addr, play_addr = build_sid_program(voice_notes, n_frames, voice_configs)
     psid_data = build_psid(
         machine_code,
         load_addr  = LOAD_ADDR,
