@@ -2,13 +2,13 @@
 """
 audio_to_sid.py — Convert an audio file to a PSID-format C64 SID file.
 
-Pipeline:
-  1. Load audio; separate harmonic and percussive components (HPSS)
-  2. Split harmonic signal into bass / mid / high bands
-  3. Analyse each band with spectral features to identify the dominant
-     instrument and choose the best SID waveform + ADSR automatically
-  4. pyin pitch tracking per band → three voice note lists
-  5. Smooth/quantise notes; map to SID register values
+Pipeline (Mahoney-inspired):
+  1. Load audio; HPSS harmonic/percussive separation
+  2. FFT autocorrelation pitch tracking per band (bass/mid/high)
+  3. rmsLow > rmsHigh voiced gate — silent when high-freq energy dominates
+  4. Per-frame waveform matching: synthesize triangle/sawtooth/pulse at the
+     detected pitch and pick the best cross-correlation match
+  5. analyze_instrument() for ADSR selection per voice
   6. Generate 6502 machine code that drives the SID chip each 50 Hz frame
   7. Write a valid PSID v2 file
 
@@ -89,6 +89,151 @@ def _highpass(y: np.ndarray, sr: int, cutoff: float) -> np.ndarray:
     return sosfilt(sos, y)
 
 
+# ---------------------------------------------------------------------------
+# Mahoney-inspired helpers: autocorrelation pitch, RMS gate, waveform matching
+# ---------------------------------------------------------------------------
+
+def _synthesize_waveform(wave: str, freq: float, sr: int, n_samples: int) -> np.ndarray:
+    """One period of a SID waveform (triangle/sawtooth/pulse), zero-mean."""
+    phase = (np.arange(n_samples) * freq / sr) % 1.0
+    if wave == 'triangle':
+        y = 1.0 - 4.0 * np.abs(phase - 0.5)
+    elif wave == 'sawtooth':
+        y = 2.0 * phase - 1.0
+    else:  # pulse 50%
+        y = np.where(phase < 0.5, 1.0, -1.0).astype(float)
+    return y - float(np.mean(y))
+
+
+def _autocorr_pitch(y: np.ndarray, sr: int, fmin: float, fmax: float,
+                    hop_length: int, n_frames: int) -> list[float]:
+    """
+    Per-frame pitch via FFT autocorrelation (Mahoney-style).
+    Uses a 2× overlap window and parabolic interpolation on the peak.
+    Returns Hz per frame; 0.0 = unvoiced (autocorr peak < 30% of zero-lag).
+    """
+    lag_min = max(1, int(sr / fmax))
+    lag_max = int(sr / fmin)
+    win_size = hop_length * 2
+
+    pitches: list[float] = []
+    for i in range(n_frames):
+        start = i * hop_length
+        end   = start + win_size
+        if end > len(y):
+            pitches.append(0.0)
+            continue
+
+        frame = y[start:end].copy()
+        frame -= np.mean(frame)
+        frame *= np.hanning(len(frame))
+
+        # FFT-based autocorrelation (O(n log n))
+        n_fft = 1 << int(np.ceil(np.log2(2 * win_size)))
+        F = np.fft.rfft(frame, n=n_fft)
+        r = np.fft.irfft(F * np.conj(F))[:win_size]
+
+        r0 = r[0]
+        if r0 < 1e-10 or lag_max >= win_size:
+            pitches.append(0.0)
+            continue
+
+        r_search  = r[lag_min:lag_max]
+        peak_idx  = int(np.argmax(r_search))
+        peak_val  = float(r_search[peak_idx])
+
+        if peak_val / r0 < 0.30:
+            pitches.append(0.0)
+            continue
+
+        lag = float(lag_min + peak_idx)
+        # Parabolic interpolation for sub-sample accuracy
+        if 0 < peak_idx < len(r_search) - 1:
+            a, b, g = r_search[peak_idx-1], r_search[peak_idx], r_search[peak_idx+1]
+            denom = a - 2*b + g
+            if abs(denom) > 1e-10:
+                lag += 0.5 * (a - g) / denom
+
+        pitches.append(float(sr) / lag)
+    return pitches
+
+
+def _voiced_rms_gate(y: np.ndarray, sr: int, hop_length: int,
+                     n_frames: int, split_hz: float = 3000.0) -> np.ndarray:
+    """
+    Mahoney-style voiced gate: voiced when rmsLow > rmsHigh and above 3% of
+    the peak rmsLow. Smooths isolated voiced/silent single frames.
+    """
+    low  = _lowpass(y,  sr, split_hz)
+    high = _highpass(y, sr, split_hz)
+
+    voiced  = np.zeros(n_frames, dtype=bool)
+    rms_low = np.zeros(n_frames)
+
+    for i in range(n_frames):
+        s, e = i * hop_length, min((i + 1) * hop_length, len(y))
+        rl = float(np.sqrt(np.mean(low[s:e]  ** 2) + 1e-12))
+        rh = float(np.sqrt(np.mean(high[s:e] ** 2) + 1e-12))
+        rms_low[i] = rl
+        voiced[i]  = rl > rh
+
+    threshold = float(np.max(rms_low)) * 0.03
+    voiced &= rms_low > threshold
+
+    # Remove isolated voiced single frames; fill isolated silent single frames
+    for i in range(1, n_frames - 1):
+        if voiced[i] and not voiced[i-1] and not voiced[i+1]:
+            voiced[i] = False
+    for i in range(1, n_frames - 1):
+        if not voiced[i] and voiced[i-1] and voiced[i+1]:
+            voiced[i] = True
+
+    return voiced
+
+
+def _match_waveform_per_frame(y: np.ndarray, sr: int, notes: list[int],
+                               hop_length: int) -> list[int]:
+    """
+    For each voiced (non-zero) note, synthesize triangle/sawtooth/pulse at
+    that pitch and pick the waveform with the highest zero-lag normalized
+    cross-correlation against the actual audio frame.
+    Returns a SID waveform byte (0x10/0x20/0x40) per frame.
+    Unvoiced frames return 0x10 as a neutral placeholder.
+    """
+    WAVES = [('triangle', 0x10), ('sawtooth', 0x20), ('pulse', 0x40)]
+    ctrl: list[int] = []
+
+    for i, midi in enumerate(notes):
+        if midi == 0:
+            ctrl.append(0x10)
+            continue
+
+        hz  = midi_to_hz(midi)
+        s   = i * hop_length
+        e   = min(s + hop_length, len(y))
+        frm = y[s:e].copy()
+        frm -= np.mean(frm)
+        n   = len(frm)
+        pk  = np.max(np.abs(frm))
+        if n == 0 or pk < 1e-8:
+            ctrl.append(0x10)
+            continue
+
+        frm_n = frm / pk
+        best_byte, best_score = 0x10, -np.inf
+        for name, byte in WAVES:
+            synth = _synthesize_waveform(name, hz, sr, n)
+            sp = np.max(np.abs(synth))
+            if sp < 1e-8:
+                continue
+            score = float(np.dot(frm_n, synth / sp)) / n
+            if score > best_score:
+                best_score, best_byte = score, byte
+
+        ctrl.append(best_byte)
+    return ctrl
+
+
 def analyze_instrument(y: np.ndarray, sr: int, band: str) -> dict:
     """
     Classify the dominant instrument in y using spectral features and return
@@ -159,24 +304,20 @@ def analyze_instrument(y: np.ndarray, sr: int, band: str) -> dict:
             return {'waveform': 0x10, 'atdec': 0x19, 'sustrel': 0xA4, 'name': 'soft high lead'}
 
 
-def _f0_to_notes(f0: np.ndarray, voiced: np.ndarray,
-                 midi_lo: int, midi_hi: int, n_frames: int) -> list[int]:
-    """Convert pyin f0 array to a list of clamped MIDI notes (0 = silence)."""
+def _autocorr_to_notes(pitches: list[float], voiced: np.ndarray,
+                       midi_lo: int, midi_hi: int) -> list[int]:
+    """Convert autocorr Hz list + voiced mask to clamped MIDI notes (0 = silence)."""
     notes = []
-    for i in range(min(len(f0), n_frames)):
-        if voiced[i] and f0[i] > 0 and not np.isnan(f0[i]):
-            midi = hz_to_midi(f0[i])
-            # Shift octaves until in range rather than hard-clamp
+    for hz, is_voiced in zip(pitches, voiced):
+        if is_voiced and hz > 0:
+            midi = hz_to_midi(hz)
             while midi < midi_lo:
                 midi += 12
             while midi > midi_hi:
                 midi -= 12
-            midi = max(midi_lo, min(midi_hi, midi))
+            notes.append(max(midi_lo, min(midi_hi, midi)))
         else:
-            midi = 0
-        notes.append(midi)
-    while len(notes) < n_frames:
-        notes.append(0)
+            notes.append(0)
     return notes
 
 
@@ -197,68 +338,80 @@ def _smooth_notes(notes: list[int], min_hold: int = 4) -> list[int]:
 
 
 def extract_voices(y: np.ndarray, sr: int,
-                   hop_length: int, n_frames: int) -> tuple[list, list, list, list]:
+                   hop_length: int, n_frames: int) -> tuple:
     """
-    Return three per-frame MIDI note lists (0 = silence) and a list of three
-    voice config dicts (waveform, atdec, sustrel, name) chosen by instrument
-    analysis of each frequency band:
+    Return:
+      melody, bass, high  — per-frame MIDI note lists (0 = silence)
+      voice_ctrl          — per-frame SID waveform bytes, one list per voice
+      voice_configs       — ADSR config dicts, one per voice
 
-      voice 0 — mid band  C3–C6  (melody / lead)
-      voice 1 — bass band C1–C3  (bass instrument)
-      voice 2 — high band C4–C7  (upper harmonic / counter-melody)
+    Pipeline (Mahoney-inspired):
+      1. HPSS harmonic/percussive separation
+      2. FFT autocorrelation pitch tracking per band
+      3. rmsLow/rmsHigh voiced gate (Mahoney's silence criterion)
+      4. Per-frame waveform matching: synthesize triangle/sawtooth/pulse and
+         pick whichever correlates best with the actual audio at that pitch
+      5. analyze_instrument() used only for ADSR selection
     """
+    from collections import Counter
+
     print("  Separating harmonic / percussive components…")
     harmonic, _ = librosa.effects.hpss(y, margin=3.0)
 
     bass_sig = _lowpass(harmonic, sr, 450.0)
     mid_sig  = _bandpass(harmonic, sr, 450.0, 2000.0)
-    high_sig = _highpass(harmonic, sr, 2000.0)
 
-    # --- Instrument analysis per band ---
-    print("  Analysing instruments…")
-    cfg_mid  = analyze_instrument(mid_sig,  sr, 'mid')
-    cfg_bass = analyze_instrument(bass_sig, sr, 'bass')
-    cfg_high = analyze_instrument(high_sig, sr, 'high')
-    print(f"    Voice 0 (mid):  {cfg_mid['name']}")
-    print(f"    Voice 1 (bass): {cfg_bass['name']}")
-    print(f"    Voice 2 (high): {cfg_high['name']}")
-
-    # --- Voice 0: mid-range melody, C3–C6 ---
-    print("  Tracking melody (C3–C6)…")
-    f0_mel, voiced_mel, _ = librosa.pyin(
-        harmonic,
-        fmin=librosa.note_to_hz('C3'),
-        fmax=librosa.note_to_hz('C6'),
-        sr=sr, hop_length=hop_length)
-    melody = _smooth_notes(_f0_to_notes(f0_mel, voiced_mel, 48, 84, n_frames), min_hold=4)
+    # Global voiced gate on harmonic signal (Mahoney: silent when high freq dominates)
+    print("  Computing voiced gate (rmsLow vs rmsHigh)…")
+    gate = _voiced_rms_gate(harmonic, sr, hop_length, n_frames, split_hz=3000.0)
 
     # --- Voice 1: bass, C1–C3 ---
-    print("  Tracking bass (C1–C3)…")
-    f0_bass, voiced_bass, _ = librosa.pyin(
-        bass_sig,
-        fmin=librosa.note_to_hz('C1'),
-        fmax=librosa.note_to_hz('C3'),
-        sr=sr, hop_length=hop_length)
-    bass = _smooth_notes(_f0_to_notes(f0_bass, voiced_bass, 24, 48, n_frames), min_hold=4)
+    print("  Tracking bass (C1–C3) via autocorrelation…")
+    p_bass   = _autocorr_pitch(bass_sig, sr, librosa.note_to_hz('C1'),
+                                librosa.note_to_hz('C3'), hop_length, n_frames)
+    v_bass   = gate & np.array([p > 0 for p in p_bass])
+    bass     = _smooth_notes(_autocorr_to_notes(p_bass, v_bass, 24, 48), min_hold=4)
 
-    # --- Voice 2: high-mid counter-melody, C4–C7 ---
-    # Use voiced_prob > 0.6 to suppress low-confidence spurious detections,
-    # and a longer min_hold to reduce note jitter on this voice.
-    print("  Tracking high lead (C4–C7)…")
-    f0_high, voiced_high, voiced_prob = librosa.pyin(
-        mid_sig,
-        fmin=librosa.note_to_hz('C4'),
-        fmax=librosa.note_to_hz('C7'),
-        sr=sr, hop_length=hop_length)
-    voiced_high_strict = voiced_high & (voiced_prob > 0.6)
-    high = _smooth_notes(_f0_to_notes(f0_high, voiced_high_strict, 60, 96, n_frames), min_hold=6)
+    # --- Voice 0: melody, C3–C6 ---
+    print("  Tracking melody (C3–C6) via autocorrelation…")
+    p_mel    = _autocorr_pitch(harmonic, sr, librosa.note_to_hz('C3'),
+                               librosa.note_to_hz('C6'), hop_length, n_frames)
+    v_mel    = gate & np.array([p > 0 for p in p_mel])
+    melody   = _smooth_notes(_autocorr_to_notes(p_mel, v_mel, 48, 84), min_hold=4)
 
-    # voice_configs ordered to match (voice0, voice1, voice2)
-    return melody, bass, high, [cfg_mid, cfg_bass, cfg_high]
+    # --- Voice 2: high lead, C4–C7 (longer hold to suppress jitter) ---
+    print("  Tracking high lead (C4–C7) via autocorrelation…")
+    p_high   = _autocorr_pitch(mid_sig, sr, librosa.note_to_hz('C4'),
+                               librosa.note_to_hz('C7'), hop_length, n_frames)
+    v_high   = gate & np.array([p > 0 for p in p_high])
+    high     = _smooth_notes(_autocorr_to_notes(p_high, v_high, 60, 96), min_hold=6)
+
+    # Per-frame waveform matching (Mahoney's correlateWaveforms, scaled to 3 SID waveforms)
+    print("  Matching waveforms per frame…")
+    ctrl_mel  = _match_waveform_per_frame(harmonic, sr, melody, hop_length)
+    ctrl_bass = _match_waveform_per_frame(bass_sig, sr, bass,   hop_length)
+    ctrl_high = _match_waveform_per_frame(mid_sig,  sr, high,   hop_length)
+
+    # analyze_instrument for ADSR only; override its waveform with the matched dominant
+    print("  Analysing instruments for ADSR…")
+    cfg_mid  = analyze_instrument(harmonic, sr, 'mid')
+    cfg_bass = analyze_instrument(bass_sig, sr, 'bass')
+    cfg_high = analyze_instrument(mid_sig,  sr, 'high')
+
+    for cfg, ctrl in [(cfg_mid, ctrl_mel), (cfg_bass, ctrl_bass), (cfg_high, ctrl_high)]:
+        voiced_ctrl = [c for c in ctrl if c != 0x10] or [0x10]
+        cfg['waveform'] = Counter(voiced_ctrl).most_common(1)[0][0]
+
+    print(f"    Voice 0 melody: {cfg_mid['name']}  dominant waveform={hex(cfg_mid['waveform'])}")
+    print(f"    Voice 1 bass:   {cfg_bass['name']}  dominant waveform={hex(cfg_bass['waveform'])}")
+    print(f"    Voice 2 high:   {cfg_high['name']}  dominant waveform={hex(cfg_high['waveform'])}")
+
+    return melody, bass, high, [ctrl_mel, ctrl_bass, ctrl_high], [cfg_mid, cfg_bass, cfg_high]
 
 
 def build_sid_program(voice_notes: list[list[int]], total_frames: int,
-                      voice_configs: list[dict] | None = None) -> tuple[bytes, int, int]:
+                      voice_configs: list[dict] | None = None,
+                      voice_ctrl: list[list[int]] | None = None) -> tuple[bytes, int, int]:
     """
     Build 6502 machine code for a PSID tune.
 
@@ -297,11 +450,16 @@ def build_sid_program(voice_notes: list[list[int]], total_frames: int,
     for frame in range(total_frames):
         for v, voice in enumerate([melody, bass, harmony]):
             midi = voice[frame] if frame < len(voice) else 0
+            # Use per-frame matched waveform if available, else fall back to voice default
+            if voice_ctrl and frame < len(voice_ctrl[v]):
+                w = voice_ctrl[v][frame]
+            else:
+                w = waveforms[v]
             if midi > 0:
                 reg = hz_to_sid_freq(midi_to_hz(midi))
-                note_data += bytes([reg & 0xFF, (reg >> 8) & 0xFF, gate_on[v]])
+                note_data += bytes([reg & 0xFF, (reg >> 8) & 0xFF, w | 0x01])
             else:
-                note_data += bytes([0, 0, gate_off[v]])
+                note_data += bytes([0, 0, w & ~0x01])
 
     # ------------------------------------------------------------------
     # INIT routine at LOAD_ADDR
@@ -524,14 +682,16 @@ def main():
     print(f"  Duration: {duration_s:.1f}s  →  {n_frames} SID frames")
 
     print("Extracting voices…")
-    melody, bass, high, voice_configs = extract_voices(y, sr, hop_length=HOP, n_frames=n_frames)
+    melody, bass, high, voice_ctrl, voice_configs = extract_voices(
+        y, sr, hop_length=HOP, n_frames=n_frames)
     voice_notes = (melody, bass, high)
 
     print(f"  Encoding {n_frames} frames ({n_frames/FRAME_RATE:.1f}s)…")
 
     LOAD_ADDR = 0x1000
 
-    machine_code, init_addr, play_addr = build_sid_program(voice_notes, n_frames, voice_configs)
+    machine_code, init_addr, play_addr = build_sid_program(
+        voice_notes, n_frames, voice_configs, voice_ctrl)
     psid_data = build_psid(
         machine_code,
         load_addr  = LOAD_ADDR,
