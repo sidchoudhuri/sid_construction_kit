@@ -442,47 +442,61 @@ def extract_voices(y: np.ndarray, sr: int,
     print("  Detecting tempo and onset grid…")
     tempo, _ = librosa.beat.beat_track(y=harmonic, sr=sr, hop_length=hop_length)
     tempo_val = float(tempo) if np.ndim(tempo) == 0 else float(tempo[0])
-    # frames per 16th note = (beats/min → beats/frame) / 4 subdivisions
+    # Quantize to 8th-note grid (2 subdivisions per beat).
+    # 16th notes at ~120 BPM = only 6 frames apart — too choppy.
+    # 8th notes = ~12 frames apart; quarter notes = ~25 frames apart.
     frames_per_beat = (sr / hop_length) * (60.0 / max(tempo_val, 1.0))
-    frames_per_16th = max(1, int(round(frames_per_beat / 4)))
+    frames_per_8th  = max(1, int(round(frames_per_beat / 2)))
     print(f"    Tempo={tempo_val:.1f} BPM  →  {frames_per_beat:.1f} frames/beat  "
-          f"→  {frames_per_16th} frames/16th-note")
+          f"→  {frames_per_8th} frames/8th-note")
 
     onset_raw    = librosa.onset.onset_detect(y=harmonic, sr=sr,
                                               hop_length=hop_length, units='frames')
     onset_frames = set(int(f) for f in onset_raw)
 
-    melody = _quantize_to_grid(melody, onset_frames, frames_per_16th)
-    bass   = _quantize_to_grid(bass,   onset_frames, frames_per_16th)
-    high   = _quantize_to_grid(high,   onset_frames, frames_per_16th)
+    melody = _quantize_to_grid(melody, onset_frames, frames_per_8th)
+    bass   = _quantize_to_grid(bass,   onset_frames, frames_per_8th)
+    high   = _quantize_to_grid(high,   onset_frames, frames_per_8th)
 
-    # Voice density control: suppress high lead when it overlaps melody
-    high = _suppress_overlapping_voices(melody, high)
+    # Voice density control: suppress high lead when it is within 2 octaves of
+    # melody (24 semitones).  Keeping voices clearly separated avoids mud.
+    high = _suppress_overlapping_voices(melody, high, octave_threshold=24)
 
     n_overlap = sum(1 for m, h in zip(melody, high) if m != 0 and h != 0)
     n_total   = sum(1 for m in melody if m != 0)
     pct = 100 * n_overlap / max(n_total, 1)
     print(f"    Voice 2 active simultaneously with melody: {pct:.0f}% of melody frames")
 
-    # Per-frame waveform matching (Mahoney's correlateWaveforms, scaled to 3 SID waveforms)
-    print("  Matching waveforms per frame…")
-    ctrl_mel  = _match_waveform_per_frame(harmonic, sr, melody, hop_length)
-    ctrl_bass = _match_waveform_per_frame(bass_sig, sr, bass,   hop_length)
-    ctrl_high = _match_waveform_per_frame(mid_sig,  sr, high,   hop_length)
+    # Waveform selection: run per-frame matching once, then elect a single
+    # dominant waveform per voice and lock it for the whole song.
+    # Changing the ctrl byte every frame re-triggers the SID oscillator and
+    # causes clicks even when the note holds steady — a fixed waveform avoids this.
+    print("  Matching waveforms (electing dominant per voice)…")
+    ctrl_mel_raw  = _match_waveform_per_frame(harmonic, sr, melody, hop_length)
+    ctrl_bass_raw = _match_waveform_per_frame(bass_sig, sr, bass,   hop_length)
+    ctrl_high_raw = _match_waveform_per_frame(mid_sig,  sr, high,   hop_length)
 
-    # analyze_instrument for ADSR only; override its waveform with the matched dominant
+    # analyze_instrument for ADSR; waveform overridden by modal per-frame match
     print("  Analysing instruments for ADSR…")
     cfg_mid  = analyze_instrument(harmonic, sr, 'mid')
     cfg_bass = analyze_instrument(bass_sig, sr, 'bass')
     cfg_high = analyze_instrument(mid_sig,  sr, 'high')
 
-    for cfg, ctrl in [(cfg_mid, ctrl_mel), (cfg_bass, ctrl_bass), (cfg_high, ctrl_high)]:
-        voiced_ctrl = [c for c in ctrl if c != 0x10] or [0x10]
-        cfg['waveform'] = Counter(voiced_ctrl).most_common(1)[0][0]
+    for cfg, raw in [(cfg_mid, ctrl_mel_raw), (cfg_bass, ctrl_bass_raw), (cfg_high, ctrl_high_raw)]:
+        voiced = [c for c in raw if c != 0x10] or [0x10]
+        cfg['waveform'] = Counter(voiced).most_common(1)[0][0]
 
-    print(f"    Voice 0 melody: {cfg_mid['name']}  dominant waveform={hex(cfg_mid['waveform'])}")
-    print(f"    Voice 1 bass:   {cfg_bass['name']}  dominant waveform={hex(cfg_bass['waveform'])}")
-    print(f"    Voice 2 high:   {cfg_high['name']}  dominant waveform={hex(cfg_high['waveform'])}")
+    # Build fixed ctrl lists (same waveform byte for every frame of that voice)
+    def _fixed_ctrl(notes, waveform):
+        return [waveform if n != 0 else waveform for n in notes]
+
+    ctrl_mel  = _fixed_ctrl(melody, cfg_mid['waveform'])
+    ctrl_bass = _fixed_ctrl(bass,   cfg_bass['waveform'])
+    ctrl_high = _fixed_ctrl(high,   cfg_high['waveform'])
+
+    print(f"    Voice 0 melody: {cfg_mid['name']}  waveform={hex(cfg_mid['waveform'])}")
+    print(f"    Voice 1 bass:   {cfg_bass['name']}  waveform={hex(cfg_bass['waveform'])}")
+    print(f"    Voice 2 high:   {cfg_high['name']}  waveform={hex(cfg_high['waveform'])}")
 
     return melody, bass, high, [ctrl_mel, ctrl_bass, ctrl_high], [cfg_mid, cfg_bass, cfg_high]
 
