@@ -117,7 +117,7 @@ def analyze_instrument(y: np.ndarray, sr: int, band: str) -> dict:
     flatness   = float(np.mean(librosa.feature.spectral_flatness(y=y)))
 
     is_plucked  = pluck_score > 4.0
-    is_bright   = centroid_n  > 0.15
+    is_bright   = centroid_n  > 0.08   # 0.08*nyquist ≈ 880Hz — covers guitar/keys mid range
     is_tonal    = flatness    < 0.10
     is_perc     = flatness    > 0.25 and pluck_score > 6.0  # noisy transients, not pitched
 
@@ -210,8 +210,8 @@ def extract_voices(y: np.ndarray, sr: int,
     print("  Separating harmonic / percussive components…")
     harmonic, _ = librosa.effects.hpss(y, margin=3.0)
 
-    bass_sig = _lowpass(harmonic, sr, 300.0)
-    mid_sig  = _bandpass(harmonic, sr, 300.0, 2000.0)
+    bass_sig = _lowpass(harmonic, sr, 450.0)
+    mid_sig  = _bandpass(harmonic, sr, 450.0, 2000.0)
     high_sig = _highpass(harmonic, sr, 2000.0)
 
     # --- Instrument analysis per band ---
@@ -242,13 +242,16 @@ def extract_voices(y: np.ndarray, sr: int,
     bass = _smooth_notes(_f0_to_notes(f0_bass, voiced_bass, 24, 48, n_frames), min_hold=4)
 
     # --- Voice 2: high-mid counter-melody, C4–C7 ---
+    # Use voiced_prob > 0.6 to suppress low-confidence spurious detections,
+    # and a longer min_hold to reduce note jitter on this voice.
     print("  Tracking high lead (C4–C7)…")
-    f0_high, voiced_high, _ = librosa.pyin(
+    f0_high, voiced_high, voiced_prob = librosa.pyin(
         mid_sig,
         fmin=librosa.note_to_hz('C4'),
         fmax=librosa.note_to_hz('C7'),
         sr=sr, hop_length=hop_length)
-    high = _smooth_notes(_f0_to_notes(f0_high, voiced_high, 60, 96, n_frames), min_hold=4)
+    voiced_high_strict = voiced_high & (voiced_prob > 0.6)
+    high = _smooth_notes(_f0_to_notes(f0_high, voiced_high_strict, 60, 96, n_frames), min_hold=6)
 
     # voice_configs ordered to match (voice0, voice1, voice2)
     return melody, bass, high, [cfg_mid, cfg_bass, cfg_high]
